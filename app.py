@@ -1,7 +1,5 @@
-import os
 import re
 import json
-import pickle
 import streamlit as st
 from PyPDF2 import PdfReader
 
@@ -19,7 +17,6 @@ from transformers import pipeline
 # ----------------------
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 LLM_MODEL = "google/flan-t5-base"
-VECTORSTORE_PATH = "vectorstore.pkl"
 
 MAX_CONTEXT_CHARS = 800
 MIN_FLASHCARDS = 2
@@ -42,18 +39,6 @@ def split_text(text, chunk_size=500, overlap=100):
         chunk_overlap=overlap
     )
     return splitter.split_text(text)
-
-
-def save_vectorstore(vs):
-    with open(VECTORSTORE_PATH, "wb") as f:
-        pickle.dump(vs, f)
-
-
-def load_vectorstore():
-    if os.path.exists(VECTORSTORE_PATH):
-        with open(VECTORSTORE_PATH, "rb") as f:
-            return pickle.load(f)
-    return None
 
 
 def deduplicate_text(text):
@@ -87,13 +72,9 @@ def unique_flashcards(cards):
 
 
 def smart_fallback_flashcards(context, min_q=2):
-    """
-    Always generates meaningful questions from the material itself.
-    """
     cards = []
     sentences = re.split(r"[.\n]", context)
 
-    # 1️⃣ Definition-based
     for s in sentences:
         s = s.strip()
         if len(s) < 40:
@@ -109,7 +90,6 @@ def smart_fallback_flashcards(context, min_q=2):
         if len(cards) >= min_q:
             return cards
 
-    # 2️⃣ Explanation-based (last resort, still grounded)
     keywords = re.findall(r"\b[A-Z][a-zA-Z]{3,}\b", context)
     for kw in keywords:
         cards.append({
@@ -186,10 +166,10 @@ Rules:
 
 Format:
 [
-  {{
+  {
     "question": "string",
     "answer": "string"
-  }}
+  }
 ]
 
 Context:
@@ -206,6 +186,9 @@ st.title("📚 ContextIQ: Exam Preparation Assistant")
 # ----------------------
 # SESSION STATE
 # ----------------------
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
 if "flashcards" not in st.session_state:
     st.session_state.flashcards = []
 
@@ -223,15 +206,14 @@ if uploaded_files:
     texts = split_text(raw_text)
 
     embeddings = get_embeddings()
-    vectorstore = FAISS.from_texts(texts, embeddings)
-    save_vectorstore(vectorstore)
+    st.session_state.vectorstore = FAISS.from_texts(texts, embeddings)
 
     st.success("✅ Documents indexed successfully")
 
 # ----------------------
-# LOAD VECTORSTORE
+# MAIN APP LOGIC
 # ----------------------
-vectorstore = load_vectorstore()
+vectorstore = st.session_state.vectorstore
 
 if vectorstore:
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -244,9 +226,6 @@ if vectorstore:
         chain_type_kwargs={"prompt": QA_PROMPT}
     )
 
-    # ----------------------
-    # ASK QUESTION
-    # ----------------------
     st.subheader("💬 Ask a Question")
     user_q = st.text_input("Ask from your notes")
 
@@ -261,24 +240,17 @@ if vectorstore:
 
         st.success(answer)
 
-    # ----------------------
-    # TOOLS
-    # ----------------------
     st.subheader("🛠 Tools")
     col1, col2 = st.columns(2)
 
-    # LIST TOPICS (UNCHANGED)
     with col1:
         if st.button("📌 List Topics"):
             docs = retriever.invoke("overview syllabus table of contents")
             context = safe_context("\n".join(d.page_content for d in docs))
-
             topics = (TOPIC_PROMPT | llm).invoke({"context": context})
-
             st.markdown("### 📚 Topics in the Material")
             st.write(topics)
 
-    # FLASHCARDS (NEVER FAILS)
     with col2:
         if st.button("🧠 Generate Flashcards"):
             docs = retriever.invoke("definitions key concepts")
@@ -286,24 +258,17 @@ if vectorstore:
 
             raw = llm.invoke(FLASHCARD_PROMPT.format(context=context))
             cards = extract_json(raw) or []
-
             cards = unique_flashcards(cards)
 
             if len(cards) < MIN_FLASHCARDS:
-                cards.extend(
-                    smart_fallback_flashcards(context, MIN_FLASHCARDS)
-                )
+                cards.extend(smart_fallback_flashcards(context, MIN_FLASHCARDS))
                 cards = unique_flashcards(cards)
 
             st.session_state.flashcards = cards[:MIN_FLASHCARDS]
             st.success("✅ Flashcards generated")
 
-    # ----------------------
-    # FLASHCARDS DISPLAY
-    # ----------------------
     if st.session_state.flashcards:
         st.subheader("📇 Flashcards")
-
         for i, c in enumerate(st.session_state.flashcards, 1):
             st.write(f"**Q{i}. {c['question']}**")
             st.write(c["answer"])
